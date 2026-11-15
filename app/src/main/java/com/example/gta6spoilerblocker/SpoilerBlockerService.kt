@@ -3,11 +3,18 @@ package com.example.gta6spoilerblocker
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
 import android.graphics.Rect
+import android.graphics.Shader
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.os.Build
@@ -28,7 +35,9 @@ class SpoilerBlockerService : AccessibilityService() {
     private var fullOverlayView: LinearLayout? = null
     private val cardOverlays = mutableListOf<View>()
     private var isMutedByApp = false
-    private var allowUntilTime: Long = 0
+
+    private var allowedFullscreenSignature: String? = null
+    private val allowedCardSignatures = mutableSetOf<String>()
 
     private val handler = Handler(Looper.getMainLooper())
     private var rescanRunnable: Runnable? = null
@@ -48,7 +57,6 @@ class SpoilerBlockerService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val prefs = getSharedPreferences("gta6_blocker_prefs", Context.MODE_PRIVATE)
 
-        // 1. إذا كانت الحماية مطفأة من الزر، أوقف كل شيء فوراً
         if (!prefs.getBoolean("protection_enabled", true)) {
             clearCardOverlays()
             removeFullOverlay()
@@ -59,19 +67,17 @@ class SpoilerBlockerService : AccessibilityService() {
         val packageName = event?.packageName?.toString() ?: return
         if (packageName == this.packageName) return
 
-        // 2. يعمل فقط في التطبيقات التي أضافها المستخدم بعلامة +
         val protectedApps = prefs.getStringSet("protected_apps", emptySet()) ?: emptySet()
         if (!protectedApps.contains(packageName)) {
             clearCardOverlays()
             return
         }
 
-        if (System.currentTimeMillis() < allowUntilTime) return
         if (fullOverlayView != null) return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             clearCardOverlays()
-            scheduleScan(packageName, 120)
+            scheduleScan(packageName, 90)
             return
         }
 
@@ -81,7 +87,7 @@ class SpoilerBlockerService : AccessibilityService() {
             return
         }
 
-        scheduleScan(packageName, 90)
+        scheduleScan(packageName, 70)
     }
 
     private fun scheduleScan(packageName: String, delayMs: Long) {
@@ -92,7 +98,6 @@ class SpoilerBlockerService : AccessibilityService() {
 
     private fun scanScreen(packageName: String) {
         if (fullOverlayView != null) return
-        if (System.currentTimeMillis() < allowUntilTime) return
 
         val rootNode = rootInActiveWindow ?: return
         val prefs = getSharedPreferences("gta6_blocker_prefs", Context.MODE_PRIVATE)
@@ -109,29 +114,77 @@ class SpoilerBlockerService : AccessibilityService() {
         val screenHeight = resources.displayMetrics.heightPixels
         val screenWidth = resources.displayMetrics.widthPixels
 
-        // فحص هل المستخدم الآن داخل فيديو مفتوح (في تيك توك أو يوتيوب)؟
+        // 1. حالة تيك توك أثناء تشغيل فيديو
         if (isTikTok && isTikTokFullscreenPlayer(rootNode, screenWidth, screenHeight)) {
-            muteMedia()
-            showFullBlockerOverlay(isTikTok = true)
+            val videoSig = buildFullscreenSignature(rootNode)
+            if (videoSig != allowedFullscreenSignature) {
+                muteMedia()
+                showFullBlockerOverlay(isTikTok = true, signature = videoSig)
+            }
             return
         }
 
+        // 2. حالة يوتيوب أثناء فتح فيديو أو بث مباشر
         if (isYouTube && isYouTubePlayerActive(rootNode)) {
-            muteMedia()
-            showFullBlockerOverlay(isTikTok = false)
-            return
+            // نفحص هل كلمة الحرق موجودة في عنوان/معلومات الفيديو نفسه (أعلى 60% من الشاشة) أم فقط في المقترحات بالأسفل
+            val mainVideoHasSpoiler = matchingNodes.any { node ->
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                r.top < screenHeight * 0.60
+            }
+
+            if (mainVideoHasSpoiler) {
+                val videoSig = buildFullscreenSignature(rootNode)
+                if (videoSig != allowedFullscreenSignature) {
+                    muteMedia()
+                    showFullBlockerOverlay(isTikTok = false, signature = videoSig)
+                    return
+                }
+            }
         }
 
-        // إذا كان يتصفح القائمة الخارجية (صورة العرض والوصف في يوتيوب أو منشورات) -> تغبيش موضعي على البطاقة كاملة
+        // 3. حالة تصفح القائمة الخارجية في يوتيوب أو المقترحات أسفل الفيديو
         val coveredRects = mutableListOf<Rect>()
         for (node in matchingNodes) {
             if (cardOverlays.size >= 6) break
+
+            val nodeRect = Rect()
+            node.getBoundsInScreen(nodeRect)
+            // تجاهل شريط البحث والأزرار العلوية الصغيرة جداً
+            if (nodeRect.top < 170 && nodeRect.height() < 160) continue
+
+            val cardSig = buildNodeSignature(node)
+            if (allowedCardSignatures.contains(cardSig)) continue
+
             val cardRect = findBestCardRect(node, screenWidth, screenHeight) ?: continue
             if (coveredRects.any { Rect.intersects(it, cardRect) }) continue
 
             coveredRects.add(cardRect)
-            showCardBlurOverlay(cardRect)
+            showCardBlurOverlay(cardRect, cardSig)
         }
+    }
+
+    private fun buildFullscreenSignature(root: AccessibilityNodeInfo): String {
+        val parts = mutableListOf<String>()
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var count = 0
+        while (q.isNotEmpty() && count < 90 && parts.size < 6) {
+            val n = q.removeFirst()
+            count++
+            val t = (n.text ?: "").toString().trim()
+            if (t.length >= 3 && !t.all { it.isDigit() || it == ':' }) {
+                parts.add(t.take(40))
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { q.add(it) }
+            }
+        }
+        return parts.joinToString("|")
+    }
+
+    private fun buildNodeSignature(node: AccessibilityNodeInfo): String {
+        return "${node.text ?: ""}_${node.contentDescription ?: ""}".trim().take(100)
     }
 
     private fun isYouTubePlayerActive(root: AccessibilityNodeInfo): Boolean {
@@ -149,7 +202,7 @@ class SpoilerBlockerService : AccessibilityService() {
             ) {
                 val rect = Rect()
                 node.getBoundsInScreen(rect)
-                if (rect.height() > 280) return true
+                if (rect.height() > 260) return true
             }
             val desc = (node.contentDescription ?: "").toString().lowercase()
             if (desc.contains("enter fullscreen") ||
@@ -170,21 +223,25 @@ class SpoilerBlockerService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var checked = 0
-        while (queue.isNotEmpty() && checked < 150) {
+        while (queue.isNotEmpty() && checked < 180) {
             val node = queue.removeFirst()
             checked++
             val desc = (node.contentDescription ?: "").toString().lowercase()
-            if (desc.contains("like video") ||
+            if (desc.contains("like") ||
                 desc.contains("إعجاب") ||
+                desc.contains("أعجبني") ||
                 desc.contains("comment") ||
                 desc.contains("تعليق") ||
-                desc.contains("share video")
+                desc.contains("share") ||
+                desc.contains("مشاركة") ||
+                desc.contains("صوت أصلي") ||
+                desc.contains("original sound")
             ) {
                 return true
             }
             val rect = Rect()
             node.getBoundsInScreen(rect)
-            if (rect.width() > screenW * 0.85 && rect.height() > screenH * 0.72) {
+            if (rect.width() > screenW * 0.85 && rect.height() > screenH * 0.55) {
                 val cls = node.className?.toString() ?: ""
                 if (cls.contains("ViewPager") || cls.contains("SurfaceView") || cls.contains("TextureView")) {
                     return true
@@ -204,7 +261,8 @@ class SpoilerBlockerService : AccessibilityService() {
     ) {
         if (node == null || !node.isVisibleToUser) return
 
-        if (!node.isEditable) {
+        val resId = (node.viewIdResourceName ?: "").lowercase()
+        if (!node.isEditable && !resId.contains("search")) {
             val text = "${node.text ?: ""} ${node.contentDescription ?: ""}".lowercase()
             if (text.isNotBlank() && keywords.any { text.contains(it) }) {
                 results.add(node)
@@ -217,22 +275,37 @@ class SpoilerBlockerService : AccessibilityService() {
         }
     }
 
+    // الصعود حتى نجد حاوية البطاقة الكاملة (صورة العرض + العنوان والوصف معاً)
     private fun findBestCardRect(node: AccessibilityNodeInfo, screenW: Int, screenH: Int): Rect? {
         val baseRect = Rect()
         node.getBoundsInScreen(baseRect)
         var bestRect = Rect(baseRect)
 
-        var parent = node.parent
+        var current: AccessibilityNodeInfo? = node
+        var parent = current?.parent
         var steps = 0
-        while (parent != null && steps < 7) {
+
+        while (parent != null && steps < 14) {
+            val parentCls = parent.className?.toString() ?: ""
+            // إذا وصلنا للقائمة الأم (RecyclerView) فالابن الحالي هو البطاقة الكاملة بالضبط
+            if (parentCls.contains("RecyclerView") || parentCls.contains("ListView")) {
+                val cRect = Rect()
+                current?.getBoundsInScreen(cRect)
+                if (cRect.height() in 140..(screenH * 0.72).toInt() && cRect.width() >= screenW * 0.40) {
+                    bestRect = cRect
+                }
+                break
+            }
+
             val pRect = Rect()
             parent.getBoundsInScreen(pRect)
-
-            val goodWidth = pRect.width() >= screenW * 0.42
-            val goodHeight = pRect.height() in 160..(screenH * 0.56).toInt()
+            val goodWidth = pRect.width() >= screenW * 0.40
+            val goodHeight = pRect.height() in 160..(screenH * 0.68).toInt()
             if (goodWidth && goodHeight) {
                 bestRect = pRect
             }
+
+            current = parent
             parent = parent.parent
             steps++
         }
@@ -241,13 +314,55 @@ class SpoilerBlockerService : AccessibilityService() {
         return bestRect
     }
 
-    // تغبيش صورة العرض والوصف في اليوتيوب / البطاقات مع خيار متابعة أو لا
-    private fun showCardBlurOverlay(rect: Rect) {
+    // خلفية ضبابية ناعمة غير شفافة تماماً تمنع ظهور أي حركة من الفيديو
+    private fun createFrostedBlurDrawable(): Drawable {
+        val w = 90
+        val h = 160
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.parseColor("#120E1E"))
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        paint.shader = RadialGradient(
+            w * 0.25f, h * 0.25f, w * 0.85f,
+            intArrayOf(Color.parseColor("#66FF2E93"), Color.TRANSPARENT),
+            null, Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+
+        paint.shader = RadialGradient(
+            w * 0.8f, h * 0.75f, w * 0.9f,
+            intArrayOf(Color.parseColor("#5500D4FF"), Color.TRANSPARENT),
+            null, Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+
+        paint.shader = RadialGradient(
+            w * 0.5f, h * 0.5f, w * 0.7f,
+            intArrayOf(Color.parseColor("#44FF8A00"), Color.TRANSPARENT),
+            null, Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+
+        return BitmapDrawable(resources, bmp).apply {
+            isFilterBitmap = true
+        }
+    }
+
+    // تغبيش ضبابي كامل لصورة العرض والوصف في اليوتيوب
+    private fun showCardBlurOverlay(rect: Rect, cardSig: String) {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#EB12101C"))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(
+                    Color.parseColor("#FF24132E"),
+                    Color.parseColor("#FF141122"),
+                    Color.parseColor("#FF102432")
+                )
+            ).apply {
                 cornerRadius = 24f
                 setStroke(3, Color.parseColor("#FF2E93"))
             }
@@ -255,8 +370,8 @@ class SpoilerBlockerService : AccessibilityService() {
         }
 
         val msg = TextView(this).apply {
-            text = "🌫️ هذا محتوى حرق لـ GTA 6\nهل تريد العرض؟"
-            textSize = if (rect.height() < 200) 13f else 15f
+            text = "🌫️ هذا محتوى حرق لـ GTA 6\nهل تريد عرض الصورة والوصف؟"
+            textSize = if (rect.height() < 220) 13f else 15f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
@@ -280,7 +395,7 @@ class SpoilerBlockerService : AccessibilityService() {
                 cornerRadius = 18f
             }
             setOnClickListener {
-                allowUntilTime = System.currentTimeMillis() + 12000
+                allowedCardSignatures.add(cardSig)
                 clearCardOverlays()
                 unmuteMedia()
             }
@@ -300,12 +415,11 @@ class SpoilerBlockerService : AccessibilityService() {
                 cornerRadius = 18f
             }
             setOnClickListener {
-                // إبقاء البطاقة مغبشة بدون إزعاج مع السماح بالتمرير
                 card.removeAllViews()
                 card.addView(TextView(this@SpoilerBlockerService).apply {
-                    text = "🛡️ تم إخفاء محتوى GTA 6"
+                    text = "🌫️ محتوى GTA 6 محجوب"
                     textSize = 14f
-                    setTextColor(Color.parseColor("#BBBBBB"))
+                    setTextColor(Color.parseColor("#CCCCCC"))
                     gravity = Gravity.CENTER
                 })
             }
@@ -326,17 +440,13 @@ class SpoilerBlockerService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_BLUR_BEHIND,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                blurBehindRadius = 50
             }
         }
 
@@ -346,14 +456,14 @@ class SpoilerBlockerService : AccessibilityService() {
         } catch (_: Exception) { }
     }
 
-    // حجب الشاشة كاملة مع كتم الصوت عند دخول فيديو أو بث حرق
-    private fun showFullBlockerOverlay(isTikTok: Boolean) {
+    // تغطية ضبابية كاملة 100% من الحافة للحافة مع كتم الصوت
+    private fun showFullBlockerOverlay(isTikTok: Boolean, signature: String) {
         if (fullOverlayView != null) return
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(Color.parseColor("#F50B0A12"))
+            background = createFrostedBlurDrawable()
             setPadding(55, 55, 55, 55)
         }
 
@@ -361,7 +471,7 @@ class SpoilerBlockerService : AccessibilityService() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#18122B"))
+                setColor(Color.parseColor("#E6161124"))
                 cornerRadius = 36f
                 setStroke(4, Color.parseColor("#FF2E93"))
             }
@@ -373,7 +483,7 @@ class SpoilerBlockerService : AccessibilityService() {
         }
 
         val textView = TextView(this).apply {
-            text = "🔇⚠️\n\nهذا محتوى حرق لـ GTA 6\n\nهل تريد متابعة المشاهدة أو لا؟"
+            text = "🌫️🔇\n\nهذا محتوى حرق لـ GTA 6\n\nهل تريد متابعة المشاهدة أو لا؟"
             textSize = 20f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -396,7 +506,7 @@ class SpoilerBlockerService : AccessibilityService() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
             setOnClickListener {
-                allowUntilTime = System.currentTimeMillis() + 20000
+                allowedFullscreenSignature = signature
                 removeFullOverlay()
                 unmuteMedia()
             }
@@ -419,6 +529,7 @@ class SpoilerBlockerService : AccessibilityService() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
             setOnClickListener {
+                allowedFullscreenSignature = null
                 removeFullOverlay()
                 if (isTikTok) {
                     performSwipeUp()
@@ -440,11 +551,14 @@ class SpoilerBlockerService : AccessibilityService() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_BLUR_BEHIND,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                blurBehindRadius = 60
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
 
@@ -504,4 +618,4 @@ class SpoilerBlockerService : AccessibilityService() {
         removeFullOverlay()
         unmuteMedia()
     }
-}        
+}
