@@ -33,20 +33,39 @@ class SpoilerBlockerService : AccessibilityService() {
 
     private lateinit var windowManager: WindowManager
     private var fullOverlayView: LinearLayout? = null
+    private var preShieldView: LinearLayout? = null
     private val cardOverlays = mutableListOf<View>()
     private var isMutedByApp = false
 
     private var allowedFullscreenSignature: String? = null
     private val allowedCardSignatures = mutableSetOf<String>()
+    private var lastPreShieldTime: Long = 0
 
     private val handler = Handler(Looper.getMainLooper())
-    private var rescanRunnable: Runnable? = null
+    private var preShieldTimeoutRunnable: Runnable? = null
+    private var followUpScanRunnable: Runnable? = null
 
     private val defaultKeywords = setOf(
         "gta 6", "gta6", "gta vi", "gtavi", "grand theft auto 6", "grand theft auto vi",
         "قراند 6", "قراند6", "جي تي اي 6", "جي تي أي 6", "حرق قراند", "تختيم قراند",
         "نهاية قراند", "تسريب قراند", "leonida", "vice city", "lucia", "jason",
         "لوسيا", "جيسون", "ليونيدا"
+    )
+
+    private val strongCompactMatches = listOf(
+        "gta6", "gtavi", "grandtheftauto6", "grandtheftautovi",
+        "قراند6", "جيتياي6", "جتا6", "جاتا6", "غتا6",
+        "ليونيدا", "leonida", "فايسسيتي", "vicecity"
+    )
+
+    private val groupAAnchors = listOf(
+        "gta", "grandtheftauto", "قراند", "قرااند", "جيتياي", "جتا", "جاتا", "غتا",
+        "روكستار", "rockstar", "ليونيدا", "leonida", "لوسيا", "lucia", "فايسسيتي", "vicecity"
+    )
+
+    private val groupBSignals = listOf(
+        "حرق", "تسريب", "تختيم", "نهايه", "قصه", "مهمه", "قيمبلاي", "جيسون", "خريطه",
+        "تريلر", "شخصيه", "gameplay", "spoiler", "leak", "ending", "story", "trailer", "jason", "map"
     )
 
     override fun onServiceConnected() {
@@ -59,6 +78,7 @@ class SpoilerBlockerService : AccessibilityService() {
 
         if (!prefs.getBoolean("protection_enabled", true)) {
             clearCardOverlays()
+            removePreShield()
             removeFullOverlay()
             unmuteMedia()
             return
@@ -70,30 +90,99 @@ class SpoilerBlockerService : AccessibilityService() {
         val protectedApps = prefs.getStringSet("protected_apps", emptySet()) ?: emptySet()
         if (!protectedApps.contains(packageName)) {
             clearCardOverlays()
+            removePreShield()
             return
         }
 
         if (fullOverlayView != null) return
 
+        val isTikTok = packageName.contains("musically") || packageName.contains("trill")
+        val isPreShieldEnabled = prefs.getBoolean("pre_shield_enabled", true)
+
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             clearCardOverlays()
-            scheduleScan(packageName, 90)
-            return
-        }
-
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val rootNode = rootInActiveWindow
+            if (isTikTok && isPreShieldEnabled && rootNode != null) {
+                val now = System.currentTimeMillis()
+                val sw = resources.displayMetrics.widthPixels
+                val sh = resources.displayMetrics.heightPixels
+                if (now - lastPreShieldTime > 850 &&
+                    preShieldView == null &&
+                    isTikTokFullscreenPlayer(rootNode, sw, sh) &&
+                    !isCommentsSheetOpen(rootNode)
+                ) {
+                    lastPreShieldTime = now
+                    activatePreShield(packageName)
+                }
+            }
+        } else if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             clearCardOverlays()
-            scheduleScan(packageName, 30)
-            return
         }
 
-        scheduleScan(packageName, 70)
+        // فحص فوري بدون أي تأخير (0ms)
+        scanScreen(packageName)
     }
 
-    private fun scheduleScan(packageName: String, delayMs: Long) {
-        rescanRunnable?.let { handler.removeCallbacks(it) }
-        rescanRunnable = Runnable { scanScreen(packageName) }
-        handler.postDelayed(rescanRunnable!!, delayMs)
+    private fun activatePreShield(packageName: String) {
+        if (preShieldView != null || fullOverlayView != null) return
+
+        muteMedia()
+
+        val shield = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            background = createFrostedBlurDrawable()
+        }
+
+        val label = TextView(this).apply {
+            text = "⚡ جاري فحص الفيديو..."
+            textSize = 18f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        shield.addView(label)
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        try {
+            preShieldView = shield
+            windowManager.addView(preShieldView, params)
+        } catch (_: Exception) {
+            preShieldView = null
+        }
+
+        // إعادة فحص سريعة أثناء تحميل وصف الفيديو الجديد
+        followUpScanRunnable?.let { handler.removeCallbacks(it) }
+        followUpScanRunnable = Runnable {
+            scanScreen(packageName)
+            handler.postDelayed({ scanScreen(packageName) }, 170)
+        }
+        handler.postDelayed(followUpScanRunnable!!, 170)
+
+        // إزالة الدرع تلقائياً بعد 460 ملي ثانية إذا كان الفيديو آمناً
+        preShieldTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        preShieldTimeoutRunnable = Runnable {
+            removePreShield()
+            if (fullOverlayView == null) {
+                unmuteMedia()
+            }
+        }
+        handler.postDelayed(preShieldTimeoutRunnable!!, 460)
     }
 
     private fun scanScreen(packageName: String) {
@@ -101,10 +190,11 @@ class SpoilerBlockerService : AccessibilityService() {
 
         val rootNode = rootInActiveWindow ?: return
         val prefs = getSharedPreferences("gta6_blocker_prefs", Context.MODE_PRIVATE)
-        val keywords = prefs.getStringSet("keywords_set", defaultKeywords) ?: defaultKeywords
+        val rawKeywords = prefs.getStringSet("keywords_set", defaultKeywords) ?: defaultKeywords
+        val normalizedCustomKeywords = rawKeywords.map { normalizeSpaced(it) }.filter { it.length >= 2 }
 
         val matchingNodes = mutableListOf<AccessibilityNodeInfo>()
-        findMatchingNodes(rootNode, keywords, matchingNodes)
+        findMatchingNodes(rootNode, normalizedCustomKeywords, matchingNodes)
 
         clearCardOverlays()
         if (matchingNodes.isEmpty()) return
@@ -114,19 +204,20 @@ class SpoilerBlockerService : AccessibilityService() {
         val screenHeight = resources.displayMetrics.heightPixels
         val screenWidth = resources.displayMetrics.widthPixels
 
-        // 1. حالة تيك توك أثناء تشغيل فيديو
+        // 1. تيك توك أثناء تشغيل الفيديو
         if (isTikTok && isTikTokFullscreenPlayer(rootNode, screenWidth, screenHeight)) {
             val videoSig = buildFullscreenSignature(rootNode)
             if (videoSig != allowedFullscreenSignature) {
+                cancelPreShieldTimers()
+                removePreShield()
                 muteMedia()
                 showFullBlockerOverlay(isTikTok = true, signature = videoSig)
             }
             return
         }
 
-        // 2. حالة يوتيوب أثناء فتح فيديو أو بث مباشر
+        // 2. يوتيوب أثناء فتح فيديو أو بث مباشر
         if (isYouTube && isYouTubePlayerActive(rootNode)) {
-            // نفحص هل كلمة الحرق موجودة في عنوان/معلومات الفيديو نفسه (أعلى 60% من الشاشة) أم فقط في المقترحات بالأسفل
             val mainVideoHasSpoiler = matchingNodes.any { node ->
                 val r = Rect()
                 node.getBoundsInScreen(r)
@@ -143,14 +234,13 @@ class SpoilerBlockerService : AccessibilityService() {
             }
         }
 
-        // 3. حالة تصفح القائمة الخارجية في يوتيوب أو المقترحات أسفل الفيديو
+        // 3. البطاقات الخارجية (مثل يوتيوب الرئيسية والبحث والمقترحات)
         val coveredRects = mutableListOf<Rect>()
         for (node in matchingNodes) {
             if (cardOverlays.size >= 6) break
 
             val nodeRect = Rect()
             node.getBoundsInScreen(nodeRect)
-            // تجاهل شريط البحث والأزرار العلوية الصغيرة جداً
             if (nodeRect.top < 170 && nodeRect.height() < 160) continue
 
             val cardSig = buildNodeSignature(node)
@@ -162,6 +252,93 @@ class SpoilerBlockerService : AccessibilityService() {
             coveredRects.add(cardRect)
             showCardBlurOverlay(cardRect, cardSig)
         }
+    }
+
+    // محرك الذكاء اللغوي المحلي لتطبيع النص وفهم السياق والتمويه
+    private fun isSpoilerText(raw: String, customKeywords: List<String>): Boolean {
+        val spaced = normalizeSpaced(raw)
+        if (spaced.length < 3) return false
+        val compact = spaced.replace(" ", "")
+
+        // استثناء GTA 5 و San Andreas إذا لم يكن هناك ذكر للجزء السادس
+        val mentionsGta6Specific = compact.contains("6") ||
+                compact.contains("لوسيا") || compact.contains("lucia") ||
+                compact.contains("ليونيدا") || compact.contains("leonida") ||
+                Regex("\\bvi\\b").containsMatchIn(spaced)
+
+        if (!mentionsGta6Specific &&
+            (compact.contains("gta5") || compact.contains("قراند5") ||
+                    compact.contains("gtav") || compact.contains("ساناندرياس") ||
+                    compact.contains("sanandreas"))
+        ) {
+            return false
+        }
+
+        // 1. فحص الكلمات القوية والمموهة (مثل G.T.A 6 و قراند٦)
+        if (strongCompactMatches.any { compact.contains(it) }) return true
+
+        // 2. فحص gta + vi بحدود الكلمات حتى لا تتداخل مع كلمة video
+        if (compact.contains("gta") && Regex("\\bvi\\b").containsMatchIn(spaced)) return true
+
+        // 3. فحص كلمات القالب المخصصة من المستخدم
+        for (kw in customKeywords) {
+            if (spaced.contains(kw)) return true
+            val kwCompact = kw.replace(" ", "")
+            if (kwCompact.length >= 4 && compact.contains(kwCompact)) return true
+        }
+
+        // 4. فحص السياق الذكي (مرساة GTA/روكستار + مؤشر حرق/شخصية/6)
+        val hasAnchor = groupAAnchors.any { compact.contains(it) }
+        if (hasAnchor) {
+            val hasStandalone6 = Regex("\\b6\\b").containsMatchIn(spaced)
+            val hasSignal = hasStandalone6 || groupBSignals.any { compact.contains(it) }
+            if (hasSignal) return true
+        }
+
+        return false
+    }
+
+    private fun normalizeSpaced(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        for (ch in raw.lowercase()) {
+            when (ch) {
+                'أ', 'إ', 'آ' -> sb.append('ا')
+                'ى' -> sb.append('ي')
+                'ة' -> sb.append('ه')
+                '٠' -> sb.append('0')
+                '١' -> sb.append('1')
+                '٢' -> sb.append('2')
+                '٣' -> sb.append('3')
+                '٤' -> sb.append('4')
+                '٥' -> sb.append('5')
+                '٦' -> sb.append('6')
+                '٧' -> sb.append('7')
+                '٨' -> sb.append('8')
+                '٩' -> sb.append('9')
+                in '\u064B'..'\u065F', '\u0670', 'ـ' -> { }
+                '.', '-', '_', '/', '#', '@', '!', '?', ':', '،', ',', '|', '(', ')' -> sb.append(' ')
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString().replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun isCommentsSheetOpen(root: AccessibilityNodeInfo): Boolean {
+        val q = ArrayDeque<AccessibilityNodeInfo>()
+        q.add(root)
+        var checked = 0
+        while (q.isNotEmpty() && checked < 60) {
+            val n = q.removeFirst()
+            checked++
+            val t = (n.text ?: "").toString().lowercase()
+            if (t.contains("add comment") || t.contains("أضف تعليق") || t == "comments" || t == "التعليقات") {
+                return true
+            }
+            for (i in 0 until n.childCount) {
+                n.getChild(i)?.let { q.add(it) }
+            }
+        }
+        return false
     }
 
     private fun buildFullscreenSignature(root: AccessibilityNodeInfo): String {
@@ -191,7 +368,7 @@ class SpoilerBlockerService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var checked = 0
-        while (queue.isNotEmpty() && checked < 180) {
+        while (queue.isNotEmpty() && checked < 160) {
             val node = queue.removeFirst()
             checked++
             val resId = node.viewIdResourceName ?: ""
@@ -223,7 +400,7 @@ class SpoilerBlockerService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var checked = 0
-        while (queue.isNotEmpty() && checked < 180) {
+        while (queue.isNotEmpty() && checked < 160) {
             val node = queue.removeFirst()
             checked++
             val desc = (node.contentDescription ?: "").toString().lowercase()
@@ -256,26 +433,25 @@ class SpoilerBlockerService : AccessibilityService() {
 
     private fun findMatchingNodes(
         node: AccessibilityNodeInfo?,
-        keywords: Set<String>,
+        customKeywords: List<String>,
         results: MutableList<AccessibilityNodeInfo>
     ) {
         if (node == null || !node.isVisibleToUser) return
 
         val resId = (node.viewIdResourceName ?: "").lowercase()
         if (!node.isEditable && !resId.contains("search")) {
-            val text = "${node.text ?: ""} ${node.contentDescription ?: ""}".lowercase()
-            if (text.isNotBlank() && keywords.any { text.contains(it) }) {
+            val raw = "${node.text ?: ""} ${node.contentDescription ?: ""}"
+            if (raw.isNotBlank() && isSpoilerText(raw, customKeywords)) {
                 results.add(node)
                 return
             }
         }
 
         for (i in 0 until node.childCount) {
-            findMatchingNodes(node.getChild(i), keywords, results)
+            findMatchingNodes(node.getChild(i), customKeywords, results)
         }
     }
 
-    // الصعود حتى نجد حاوية البطاقة الكاملة (صورة العرض + العنوان والوصف معاً)
     private fun findBestCardRect(node: AccessibilityNodeInfo, screenW: Int, screenH: Int): Rect? {
         val baseRect = Rect()
         node.getBoundsInScreen(baseRect)
@@ -287,7 +463,6 @@ class SpoilerBlockerService : AccessibilityService() {
 
         while (parent != null && steps < 14) {
             val parentCls = parent.className?.toString() ?: ""
-            // إذا وصلنا للقائمة الأم (RecyclerView) فالابن الحالي هو البطاقة الكاملة بالضبط
             if (parentCls.contains("RecyclerView") || parentCls.contains("ListView")) {
                 val cRect = Rect()
                 current?.getBoundsInScreen(cRect)
@@ -314,7 +489,6 @@ class SpoilerBlockerService : AccessibilityService() {
         return bestRect
     }
 
-    // خلفية ضبابية ناعمة غير شفافة تماماً تمنع ظهور أي حركة من الفيديو
     private fun createFrostedBlurDrawable(): Drawable {
         val w = 90
         val h = 160
@@ -350,7 +524,6 @@ class SpoilerBlockerService : AccessibilityService() {
         }
     }
 
-    // تغبيش ضبابي كامل لصورة العرض والوصف في اليوتيوب
     private fun showCardBlurOverlay(rect: Rect, cardSig: String) {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -422,200 +595,3 @@ class SpoilerBlockerService : AccessibilityService() {
                     setTextColor(Color.parseColor("#CCCCCC"))
                     gravity = Gravity.CENTER
                 })
-            }
-        }
-
-        btnRow.addView(yesBtn)
-        btnRow.addView(gap)
-        btnRow.addView(noBtn)
-
-        card.addView(msg)
-        card.addView(btnRow)
-
-        val params = WindowManager.LayoutParams(
-            rect.width(),
-            rect.height(),
-            rect.left,
-            rect.top,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-        }
-
-        try {
-            windowManager.addView(card, params)
-            cardOverlays.add(card)
-        } catch (_: Exception) { }
-    }
-
-    // تغطية ضبابية كاملة 100% من الحافة للحافة مع كتم الصوت
-    private fun showFullBlockerOverlay(isTikTok: Boolean, signature: String) {
-        if (fullOverlayView != null) return
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            background = createFrostedBlurDrawable()
-            setPadding(55, 55, 55, 55)
-        }
-
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6161124"))
-                cornerRadius = 36f
-                setStroke(4, Color.parseColor("#FF2E93"))
-            }
-            setPadding(50, 60, 50, 60)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        val textView = TextView(this).apply {
-            text = "🌫️🔇\n\nهذا محتوى حرق لـ GTA 6\n\nهل تريد متابعة المشاهدة أو لا؟"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 50)
-        }
-
-        val continueBtn = Button(this).apply {
-            text = "متابعة"
-            textSize = 17f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#00C853"))
-                cornerRadius = 25f
-            }
-            setPadding(30, 30, 30, 30)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            setOnClickListener {
-                allowedFullscreenSignature = signature
-                removeFullOverlay()
-                unmuteMedia()
-            }
-        }
-
-        val gap = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, 25) }
-
-        val cancelBtn = Button(this).apply {
-            text = "إلغاء"
-            textSize = 17f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#D50000"))
-                cornerRadius = 25f
-            }
-            setPadding(30, 30, 30, 30)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            setOnClickListener {
-                allowedFullscreenSignature = null
-                removeFullOverlay()
-                if (isTikTok) {
-                    performSwipeUp()
-                    handler.postDelayed({ unmuteMedia() }, 700)
-                } else {
-                    unmuteMedia()
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                }
-            }
-        }
-
-        card.addView(textView)
-        card.addView(continueBtn)
-        card.addView(gap)
-        card.addView(cancelBtn)
-        root.addView(card)
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-        }
-
-        fullOverlayView = root
-        windowManager.addView(fullOverlayView, params)
-    }
-
-    private fun clearCardOverlays() {
-        for (v in cardOverlays) {
-            try {
-                windowManager.removeViewImmediate(v)
-            } catch (_: Exception) { }
-        }
-        cardOverlays.clear()
-    }
-
-    private fun removeFullOverlay() {
-        fullOverlayView?.let {
-            try {
-                windowManager.removeViewImmediate(it)
-            } catch (_: Exception) { }
-            fullOverlayView = null
-        }
-    }
-
-    private fun muteMedia() {
-        if (!isMutedByApp) {
-            val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-            isMutedByApp = true
-        }
-    }
-
-    private fun unmuteMedia() {
-        if (isMutedByApp) {
-            val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            isMutedByApp = false
-        }
-    }
-
-    private fun performSwipeUp() {
-        val dm = resources.displayMetrics
-        val x = dm.widthPixels / 2f
-        val path = Path().apply {
-            moveTo(x, dm.heightPixels * 0.78f)
-            lineTo(x, dm.heightPixels * 0.18f)
-        }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 180))
-            .build()
-        dispatchGesture(gesture, null, null)
-    }
-
-    override fun onInterrupt() {
-        clearCardOverlays()
-        removeFullOverlay()
-        unmuteMedia()
-    }
-}
