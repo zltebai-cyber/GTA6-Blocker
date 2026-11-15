@@ -308,7 +308,7 @@ class SpoilerBlockerService : AccessibilityService() {
                 if (cr.height() in 140..(sh * 0.72).toInt() && cr.width() >= sw * 0.40) best = cr
                 break
             }
-            val pr = Rect().apply { parent.getBoundsInScreen(this) }
+            val pr = Rect().apply { parent?.getBoundsInScreen(this) }
             if (pr.width() >= sw * 0.40 && pr.height() in 160..(sh * 0.68).toInt()) best = pr
             cur = parent; parent = parent.parent; steps++
         }
