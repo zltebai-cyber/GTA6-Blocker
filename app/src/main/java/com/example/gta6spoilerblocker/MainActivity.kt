@@ -90,7 +90,22 @@ class MainActivity : AppCompatActivity() {
                 buttonView.text = if (isChecked) "🟢 الحماية مفعّلة (مع كتم الصوت)" else "🔴 الحماية مطفأة"
             }
         }
+
+        val isPreShieldInitially = prefs.getBoolean("pre_shield_enabled", true)
+        val preShieldSwitch = Switch(this).apply {
+            text = if (isPreShieldInitially) "⚡ الدرع الاستباقي في تيك توك (مفعّل)" else "⚡ الدرع الاستباقي في تيك توك (مطفأ)"
+            textSize = 15f
+            setTextColor(Color.parseColor("#00D4FF"))
+            isChecked = isPreShieldInitially
+            setPadding(0, 24, 0, 0)
+            setOnCheckedChangeListener { buttonView, isChecked ->
+                prefs.edit().putBoolean("pre_shield_enabled", isChecked).apply()
+                buttonView.text = if (isChecked) "⚡ الدرع الاستباقي في تيك توك (مفعّل)" else "⚡ الدرع الاستباقي في تيك توك (مطفأ)"
+            }
+        }
+
         toggleBox.addView(mainSwitch)
+        toggleBox.addView(preShieldSwitch)
 
         val addAppBtn = Button(this).apply {
             text = "➕ إضافة تطبيق للحماية"
@@ -178,7 +193,7 @@ class MainActivity : AppCompatActivity() {
 
         if (protectedApps.isEmpty()) {
             val emptyMsg = TextView(this).apply {
-                text = "لا توجد تطبيقات مضافة بعد.\nاضغط (➕ إضافة تطبيق للحماية) واختر يوتيوب وتيك توك."
+                text = "لا توجد تطبيقات مضافة بعد.\nاضغط (➕ إضافة تطبيق للحماية) واختر تيك توك ويوتيوب."
                 textSize = 14f
                 setTextColor(Color.parseColor("#BBBBBB"))
                 setPadding(15, 20, 15, 20)
