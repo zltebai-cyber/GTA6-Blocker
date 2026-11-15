@@ -41,7 +41,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             isChecked = prefs.getBoolean("protection_enabled", true)
             setPadding(0, 30, 0, 30)
-            setOnCheckedChangeListener { _, isChecked ->
+            setOnCheckedChangeListener { buttonView, isChecked ->
                 prefs.edit().putBoolean("protection_enabled", isChecked).apply()
             }
         }
@@ -52,4 +52,31 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             isChecked = prefs.getBoolean("auto_mute_enabled", true)
             setPadding(0, 30, 0, 60)
-            setOnCheckedChangeListener { _, isChecke
+            setOnCheckedChangeListener { buttonView, isChecked ->
+                prefs.edit().putBoolean("auto_mute_enabled", isChecked).apply()
+            }
+        }
+
+        val btnBg = GradientDrawable().apply {
+            setColor(Color.parseColor("#FF2E93"))
+            cornerRadius = 25f
+        }
+
+        val permissionButton = Button(this).apply {
+            text = "⚙️ تفعيل إذن الخدمة من إعدادات السامسونج"
+            setTextColor(Color.WHITE)
+            background = btnBg
+            setPadding(30, 30, 30, 30)
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+        }
+
+        layout.addView(header)
+        layout.addView(protectionSwitch)
+        layout.addView(muteSwitch)
+        layout.addView(permissionButton)
+
+        setContentView(layout)
+    }
+}
